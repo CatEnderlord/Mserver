@@ -8,6 +8,7 @@ from datetime import datetime
 from collections import deque
 import threading
 
+
 app = Flask(__name__)
 
 # Store metrics in memory (last 100 entries per client)
