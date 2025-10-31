@@ -154,10 +154,10 @@ HTML_TEMPLATE = '''
 </head>
 <body>
     <div class="container">
-        <h1>🖥️ System Metrics Dashboard</h1>
+        <h1>System Metrics Dashboard</h1>
         
         <div class="api-info">
-            <h2>📡 How to Send Metrics</h2>
+            <h2>How to Send Metrics</h2>
             <p>Send metrics to this dashboard via POST request:</p>
             <p><strong>Endpoint:</strong> <code>POST {{ base_url }}/api/metrics</code></p>
             <p><strong>Example Python Code:</strong></p>
@@ -272,7 +272,7 @@ while True:
 
         {% else %}
         <div class="no-data">
-            <h2>📊 No Metrics Yet</h2>
+            <h2>No Metrics Yet</h2>
             <p>Waiting for clients to send data...</p>
             <p>Use the API endpoint above to start sending metrics.</p>
         </div>
@@ -493,13 +493,5 @@ def health():
 # ==================== MAIN ====================
 
 if __name__ == '__main__':
-    print("\n" + "="*60)
-    print("🚀 Metrics Dashboard Server Starting...")
-    print("="*60)
-    print("📊 Dashboard: http://localhost:8000")
-    print("📡 API Endpoint: http://localhost:8000/api/metrics")
-    print("💚 Health Check: http://localhost:8000/health")
-    print("="*60 + "\n")
-    
     # For local development
     app.run(host='0.0.0.0', port=8000, debug=False)
