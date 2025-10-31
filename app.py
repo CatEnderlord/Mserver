@@ -5,16 +5,16 @@ import matplotlib.pyplot as plt
 import io
 import base64
 from datetime import datetime
-from collections import deque
+import sqlite3
 import threading
-
+import json
 
 app = Flask(__name__)
 
-# Store metrics in memory (last 100 entries per client)
-metrics_store = {}
+# Database configuration
+DATABASE = 'metrics.db'
 max_entries = 100
-lock = threading.Lock()
+db_lock = threading.Lock()
 
 # HTML template with embedded table and charts
 HTML_TEMPLATE = '''
@@ -269,7 +269,6 @@ while True:
         <div class="info">
             <p>Dashboard auto-refreshes every 5 seconds | Total clients: {{ total_clients }}</p>
         </div>
-
         {% else %}
         <div class="no-data">
             <h2>No Metrics Yet</h2>
@@ -281,6 +280,223 @@ while True:
 </body>
 </html>
 '''
+
+# ==================== DATABASE FUNCTIONS ====================
+
+def init_db():
+    """Initialize the SQLite database."""
+    with db_lock:
+        conn = sqlite3.connect(DATABASE)
+        cursor = conn.cursor()
+        
+        # Create metrics table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id TEXT NOT NULL,
+                client_name TEXT,
+                timestamp TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                cpu_percent REAL,
+                gpu_percent REAL,
+                ram_json TEXT,
+                ping_ms REAL,
+                internet_connected INTEGER,
+                raw_data TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Create index for faster queries
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_client_id ON metrics(client_id)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_timestamp ON metrics(timestamp DESC)
+        ''')
+        
+        conn.commit()
+        conn.close()
+
+def get_db_connection():
+    """Get a database connection."""
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def cleanup_old_metrics(client_id):
+    """Keep only the latest max_entries for each client."""
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Count entries for this client
+        cursor.execute('SELECT COUNT(*) as count FROM metrics WHERE client_id = ?', (client_id,))
+        count = cursor.fetchone()['count']
+        
+        if count > max_entries:
+            # Delete oldest entries
+            cursor.execute('''
+                DELETE FROM metrics 
+                WHERE client_id = ? 
+                AND id NOT IN (
+                    SELECT id FROM metrics 
+                    WHERE client_id = ? 
+                    ORDER BY timestamp DESC 
+                    LIMIT ?
+                )
+            ''', (client_id, client_id, max_entries))
+            conn.commit()
+        
+        conn.close()
+
+def insert_metric(client_id, data):
+    """Insert a metric into the database."""
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Extract fields
+        client_name = data.get('client_name')
+        timestamp = data.get('timestamp')
+        received_at = data.get('received_at')
+        cpu_percent = data.get('cpu_percent')
+        gpu_percent = data.get('gpu_percent')
+        ram = data.get('ram')
+        ping_ms = data.get('ping_ms')
+        internet_connected = data.get('internet_connected')
+        
+        # Convert RAM to JSON string
+        ram_json = json.dumps(ram) if ram else None
+        
+        # Store complete raw data as JSON
+        raw_data = json.dumps(data)
+        
+        cursor.execute('''
+            INSERT INTO metrics 
+            (client_id, client_name, timestamp, received_at, cpu_percent, gpu_percent, 
+             ram_json, ping_ms, internet_connected, raw_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (client_id, client_name, timestamp, received_at, cpu_percent, gpu_percent,
+              ram_json, ping_ms, internet_connected, raw_data))
+        
+        conn.commit()
+        
+        # Get count for this client
+        cursor.execute('SELECT COUNT(*) as count FROM metrics WHERE client_id = ?', (client_id,))
+        count = cursor.fetchone()['count']
+        
+        conn.close()
+        
+        # Cleanup old entries
+        cleanup_old_metrics(client_id)
+        
+        return count
+
+def get_all_metrics(limit=50):
+    """Get all metrics from database."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT * FROM metrics 
+        ORDER BY timestamp DESC 
+        LIMIT ?
+    ''', (limit,))
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    # Convert to list of dicts
+    metrics = []
+    for row in rows:
+        metric = json.loads(row['raw_data'])
+        metric['client_id'] = row['client_id']
+        metrics.append(metric)
+    
+    return metrics
+
+def get_client_metrics(client_id=None, limit=20):
+    """Get metrics for a specific client or all clients."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if client_id:
+        cursor.execute('''
+            SELECT * FROM metrics 
+            WHERE client_id = ?
+            ORDER BY timestamp DESC 
+            LIMIT ?
+        ''', (client_id, limit))
+    else:
+        cursor.execute('''
+            SELECT * FROM metrics 
+            ORDER BY timestamp DESC 
+            LIMIT ?
+        ''', (limit,))
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    # Convert to list of dicts
+    metrics = []
+    for row in rows:
+        metric = json.loads(row['raw_data'])
+        metric['client_id'] = row['client_id']
+        metrics.append(metric)
+    
+    return metrics
+
+def get_total_clients():
+    """Get count of unique clients."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT COUNT(DISTINCT client_id) as count FROM metrics')
+    count = cursor.fetchone()['count']
+    
+    conn.close()
+    return count
+
+def get_total_metrics():
+    """Get total count of metrics."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT COUNT(*) as count FROM metrics')
+    count = cursor.fetchone()['count']
+    
+    conn.close()
+    return count
+
+def get_client_list():
+    """Get list of all clients with their info."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT 
+            client_id,
+            client_name,
+            MAX(timestamp) as last_seen,
+            COUNT(*) as metric_count
+        FROM metrics
+        GROUP BY client_id
+    ''')
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    clients = []
+    for row in rows:
+        clients.append({
+            'client_id': row['client_id'],
+            'client_name': row['client_name'] or row['client_id'],
+            'last_seen': row['last_seen'],
+            'metric_count': row['metric_count']
+        })
+    
+    return clients
 
 # ==================== HELPER FUNCTIONS ====================
 
@@ -380,38 +596,32 @@ def generate_charts(metrics_list):
 @app.route('/')
 def dashboard():
     """Display the metrics dashboard."""
-    with lock:
-        # Get all metrics from all clients
-        all_metrics = []
-        for client_id, client_metrics in metrics_store.items():
-            for metric in client_metrics:
-                metric_copy = metric.copy()
-                if 'client_id' not in metric_copy:
-                    metric_copy['client_id'] = client_id
-                all_metrics.append(metric_copy)
-        
-        # Sort by timestamp (most recent first)
-        all_metrics.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-        
-        # Get latest metrics for stat cards
-        latest = all_metrics[0] if all_metrics else None
-        
-        # Generate charts from recent metrics (last 20)
-        recent_metrics = list(reversed(all_metrics[:20]))
-        charts = generate_charts(recent_metrics)
-        
-        # Get base URL for API instructions
-        base_url = request.url_root.rstrip('/')
-        
-        return render_template_string(
-            HTML_TEMPLATE,
-            metrics=all_metrics[:50],
-            latest_metrics=latest,
-            charts=charts,
-            total_clients=len(metrics_store),
-            total_metrics=len(all_metrics),
-            base_url=base_url
-        )
+    # Get all metrics
+    all_metrics = get_all_metrics(limit=50)
+    
+    # Get latest metrics for stat cards
+    latest = all_metrics[0] if all_metrics else None
+    
+    # Generate charts from recent metrics (last 20)
+    recent_metrics = list(reversed(get_client_metrics(limit=20)))
+    charts = generate_charts(recent_metrics)
+    
+    # Get statistics
+    total_clients = get_total_clients()
+    total_metrics = get_total_metrics()
+    
+    # Get base URL for API instructions
+    base_url = request.url_root.rstrip('/')
+    
+    return render_template_string(
+        HTML_TEMPLATE,
+        metrics=all_metrics,
+        latest_metrics=latest,
+        charts=charts,
+        total_clients=total_clients,
+        total_metrics=total_metrics,
+        base_url=base_url
+    )
 
 @app.route('/api/metrics', methods=['POST'])
 def receive_metrics():
@@ -428,16 +638,14 @@ def receive_metrics():
         # Get client identifier (IP or custom name)
         client_id = data.get('client_name') or data.get('client_id') or request.remote_addr
         
-        with lock:
-            if client_id not in metrics_store:
-                metrics_store[client_id] = deque(maxlen=max_entries)
-            metrics_store[client_id].append(data)
+        # Insert into database
+        count = insert_metric(client_id, data)
         
         return jsonify({
             'status': 'success',
             'message': 'Metrics received',
             'client_id': client_id,
-            'stored_count': len(metrics_store[client_id])
+            'stored_count': count
         }), 200
         
     except Exception as e:
@@ -446,52 +654,41 @@ def receive_metrics():
 @app.route('/api/metrics', methods=['GET'])
 def get_metrics():
     """API endpoint to retrieve stored metrics."""
-    with lock:
-        all_metrics = []
-        for client_id, client_metrics in metrics_store.items():
-            for metric in client_metrics:
-                metric_copy = metric.copy()
-                if 'client_id' not in metric_copy:
-                    metric_copy['client_id'] = client_id
-                all_metrics.append(metric_copy)
-        
-        return jsonify({
-            'total_entries': len(all_metrics),
-            'total_clients': len(metrics_store),
-            'metrics': all_metrics
-        }), 200
+    all_metrics = get_all_metrics(limit=1000)
+    total_clients = get_total_clients()
+    
+    return jsonify({
+        'total_entries': len(all_metrics),
+        'total_clients': total_clients,
+        'metrics': all_metrics
+    }), 200
 
 @app.route('/api/clients', methods=['GET'])
 def get_clients():
     """API endpoint to get list of connected clients."""
-    with lock:
-        clients = []
-        for client_id, client_metrics in metrics_store.items():
-            if client_metrics:
-                latest = list(client_metrics)[-1]
-                clients.append({
-                    'client_id': client_id,
-                    'client_name': latest.get('client_name', client_id),
-                    'last_seen': latest.get('timestamp'),
-                    'metric_count': len(client_metrics)
-                })
-        
-        return jsonify({
-            'total_clients': len(clients),
-            'clients': clients
-        }), 200
+    clients = get_client_list()
+    
+    return jsonify({
+        'total_clients': len(clients),
+        'clients': clients
+    }), 200
 
 @app.route('/health')
 def health():
     """Health check endpoint for Azure."""
+    total_clients = get_total_clients()
+    
     return jsonify({
         'status': 'healthy',
-        'clients': len(metrics_store),
+        'clients': total_clients,
         'timestamp': datetime.now().isoformat()
     }), 200
 
 # ==================== MAIN ====================
 
 if __name__ == '__main__':
+    # Initialize database
+    init_db()
+    
     # For local development
     app.run(host='0.0.0.0', port=8000, debug=False)
